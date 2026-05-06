@@ -466,24 +466,60 @@ func (p *WSPlatform) sendStreamChunk(ctx context.Context, reqID, streamID, conte
 	return p.writeAndWaitAck(ctx, frame, reqID)
 }
 
-// StartTyping sends an immediate stream placeholder ("⏳") so the user gets
-// instant feedback while the agent is thinking. The pre-started stream handle
-// is stored and reused by the subsequent SendPreviewStart call.
+// StartTyping sends an immediate stream placeholder so the user gets instant
+// feedback while the agent is thinking. A goroutine appends dots to make the
+// content grow, which triggers the WeChat Work client to re-render.
 func (p *WSPlatform) StartTyping(ctx context.Context, rctx any) (stop func()) {
 	rc, ok := rctx.(wsReplyContext)
 	if !ok || rc.reqID == "" {
 		return func() {}
 	}
 	streamID := p.generateReqID("stream")
-	if err := p.sendStreamChunk(ctx, rc.reqID, streamID, "⏳", false); err != nil {
+	base := "⏳ 思考中"
+	if err := p.sendStreamChunk(ctx, rc.reqID, streamID, base, false); err != nil {
 		slog.Debug("wecom-ws: typing placeholder failed", "error", err)
 		return func() {}
 	}
-	handle := &wecomStreamHandle{reqID: rc.reqID, streamID: streamID, lastContent: "⏳"}
+	handle := &wecomStreamHandle{reqID: rc.reqID, streamID: streamID, lastContent: base}
 	p.typingMu.Lock()
 	p.typingHandles[rc.reqID] = handle
 	p.typingMu.Unlock()
+
+	stopCh := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		dots := ""
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				p.typingMu.Lock()
+				h := p.typingHandles[rc.reqID]
+				p.typingMu.Unlock()
+				if h == nil {
+					return
+				}
+				dots += "."
+				if len(dots) > 10 {
+					dots = "."
+				}
+				frame := base + dots
+				_ = p.sendStreamChunk(ctx, rc.reqID, streamID, frame, false)
+				p.typingMu.Lock()
+				if p.typingHandles[rc.reqID] != nil {
+					p.typingHandles[rc.reqID].lastContent = frame
+				}
+				p.typingMu.Unlock()
+			}
+		}
+	}()
+
 	return func() {
+		close(stopCh)
 		p.typingMu.Lock()
 		delete(p.typingHandles, rc.reqID)
 		p.typingMu.Unlock()

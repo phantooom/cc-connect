@@ -36,6 +36,9 @@ type WSPlatform struct {
 	reqSeq      atomic.Int64 // monotonic counter for generating unique req_id
 	missedPong  atomic.Int32 // consecutive heartbeat acks not received
 	pendingAcks sync.Map     // req_id -> chan error, for sequential send with ack waiting
+
+	typingMu      sync.Mutex                    // protects typingHandles
+	typingHandles map[string]*wecomStreamHandle  // reqID -> pre-started stream handle from StartTyping
 }
 
 const wsAckTimeout = 5 * time.Second
@@ -115,9 +118,10 @@ func newWebSocket(opts map[string]any) (core.Platform, error) {
 	allowFrom, _ := opts["allow_from"].(string)
 
 	return &WSPlatform{
-		botID:     botID,
-		secret:    secret,
-		allowFrom: allowFrom,
+		botID:         botID,
+		secret:        secret,
+		allowFrom:     allowFrom,
+		typingHandles: make(map[string]*wecomStreamHandle),
 	}, nil
 }
 
@@ -462,9 +466,33 @@ func (p *WSPlatform) sendStreamChunk(ctx context.Context, reqID, streamID, conte
 	return p.writeAndWaitAck(ctx, frame, reqID)
 }
 
+// StartTyping sends an immediate stream placeholder ("⏳") so the user gets
+// instant feedback while the agent is thinking. The pre-started stream handle
+// is stored and reused by the subsequent SendPreviewStart call.
+func (p *WSPlatform) StartTyping(ctx context.Context, rctx any) (stop func()) {
+	rc, ok := rctx.(wsReplyContext)
+	if !ok || rc.reqID == "" {
+		return func() {}
+	}
+	streamID := p.generateReqID("stream")
+	if err := p.sendStreamChunk(ctx, rc.reqID, streamID, "⏳", false); err != nil {
+		slog.Debug("wecom-ws: typing placeholder failed", "error", err)
+		return func() {}
+	}
+	handle := &wecomStreamHandle{reqID: rc.reqID, streamID: streamID, lastContent: "⏳"}
+	p.typingMu.Lock()
+	p.typingHandles[rc.reqID] = handle
+	p.typingMu.Unlock()
+	return func() {
+		p.typingMu.Lock()
+		delete(p.typingHandles, rc.reqID)
+		p.typingMu.Unlock()
+	}
+}
+
 // SendPreviewStart initiates a streaming preview by sending the first chunk
-// with finish=false. Returns a wecomStreamHandle for subsequent UpdateMessage
-// and FinishStream calls.
+// with finish=false. If a typing placeholder was already started for this
+// reqID (via StartTyping), the existing stream is reused.
 func (p *WSPlatform) SendPreviewStart(ctx context.Context, rctx any, content string) (any, error) {
 	rc, ok := rctx.(wsReplyContext)
 	if !ok {
@@ -472,6 +500,23 @@ func (p *WSPlatform) SendPreviewStart(ctx context.Context, rctx any, content str
 	}
 	if rc.reqID == "" {
 		return nil, fmt.Errorf("wecom-ws: empty reqID, cannot start stream preview")
+	}
+
+	// Reuse the stream started by StartTyping if available.
+	p.typingMu.Lock()
+	handle, hasTyping := p.typingHandles[rc.reqID]
+	if hasTyping {
+		delete(p.typingHandles, rc.reqID)
+	}
+	p.typingMu.Unlock()
+
+	if hasTyping {
+		if err := p.sendStreamChunk(ctx, handle.reqID, handle.streamID, content, false); err != nil {
+			return nil, fmt.Errorf("wecom-ws: stream preview update (from typing) failed: %w", err)
+		}
+		handle.lastContent = content
+		slog.Debug("wecom-ws: stream preview reused typing handle", "stream_id", handle.streamID, "content_len", len(content))
+		return handle, nil
 	}
 
 	streamID := p.generateReqID("stream")
@@ -496,6 +541,7 @@ func (p *WSPlatform) UpdateMessage(ctx context.Context, previewHandle any, conte
 // KeepPreviewOnFinish returns true because WeChat Work stream messages are
 // rendered in-place; there is no separate message to delete and re-send.
 func (p *WSPlatform) KeepPreviewOnFinish() bool { return true }
+
 
 // FinishStream sends the final stream chunk with finish=true, which tells the
 // WeChat Work client to stop the loading animation.
